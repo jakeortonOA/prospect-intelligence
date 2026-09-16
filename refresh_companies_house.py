@@ -498,7 +498,7 @@ def enrich_existing_master(master, session, api_key):
         if eligible:
             row["gate_status"] = "research"
             # Re-open only automatic archived records caused by missing/old profile data.
-            if row.get("archived_reason", "").startswith(("Current Companies House", "Company status", "Registered office", "Current SIC")):
+            if (row.get("archived_reason") or "").startswith(("Current Companies House", "Company status", "Registered office", "Current SIC")):
                 row["candidate_state"] = "active"
                 row["archived_reason"] = None
         else:
