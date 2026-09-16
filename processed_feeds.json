@@ -6,5 +6,23 @@
     "candidates_total": 178,
     "research_candidates": 42,
     "status": "seeded_from_verified_run"
+  },
+  {
+    "date": "2026-09-16",
+    "file": "Accounts_Bulk_Data-2026-09-16.zip",
+    "filings": 12800,
+    "unique_companies": 12753,
+    "parse_failures": 0,
+    "screened_candidates": 33,
+    "research_candidates": 33,
+    "discarded_after_screen": 12720,
+    "new_candidates": 33,
+    "refreshed_candidates": 0,
+    "newly_archived": 0,
+    "retained_master_total": 75,
+    "active_candidate_total": 75,
+    "archived_candidate_total": 0,
+    "status": "processed",
+    "processed_at_utc": "2026-09-16T13:26:35.052736+00:00"
   }
 ]
