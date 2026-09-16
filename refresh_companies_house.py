@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import re
+import time
 import zipfile
 from datetime import datetime, timezone, date
 from pathlib import Path
@@ -22,38 +24,37 @@ STATUSJS = DATA / "feed_status.js"
 PROCESSED = DATA / "processed_feeds.json"
 
 INDEX_URL = "https://download.companieshouse.gov.uk/en_accountsdata.html"
+PROFILE_URL = "https://api.company-information.service.gov.uk/company/{company_number}"
 FILE_RE = re.compile(r'href=["\']([^"\']*Accounts_Bulk_Data-(\d{4}-\d{2}-\d{2})\.zip)["\']', re.I)
 COMPANY_RE = re.compile(r'_((?:SC|NI|OC|SO|LP|SL|FC|NF|NL|IP|SP|RS)?[A-Z0-9]{5,8})_(\d{8})(?:\.|_)', re.I)
 
 RETENTION_DAYS = 30
+PROFILE_REFRESH_DAYS = 30
 
-EXCLUDE = [
-    "accountant","accountancy","bookkeeping","tax adviser","tax advisor",
-    "financial adviser","financial advisor","wealth management","insurance broker",
-    "solicitor","law firm","car dealer","used car","motor dealer","motor retail",
-    "restaurant","cafe","public house","hotel","nursery","childcare",
-    "residential care","nursing care","charity","membership organisation",
-    "membership organization","property investment","property letting",
-    "investment holding"
+# Cheap pre-API exclusions, only to avoid wasting enrichment calls on obvious mismatches.
+NAME_ACTIVITY_EXCLUDE = [
+    "accountant", "accountancy", "bookkeeping", "tax adviser", "tax advisor",
+    "financial adviser", "financial advisor", "wealth management", "insurance broker",
+    "solicitor", "law firm", "car dealer", "used car", "motor dealer", "motor retail",
+    "restaurant", "cafe", "public house", "hotel", "nursery", "childcare",
+    "residential care", "nursing care", "charity", "membership organisation",
+    "membership organization", "property investment", "property letting",
+    "investment holding",
 ]
 
-SECTORS = {
-    "Construction": [
-        "construction","contractor","building contractor","civil engineering",
-        "roofing","plumbing","electrical installation","groundworks","fit out","interiors"
-    ],
-    "Wholesale": [
-        "wholesale","wholesaler","distribution","distributor",
-        "trade supplier","merchant","importer"
-    ],
-    "Manufacturing": [
-        "manufactur","engineering","fabricat","machining","industrial equipment","factory"
-    ],
-    "Business services": [
-        "business services","managed services","it services","software services",
-        "commercial cleaning","facilities management","b2b marketing",
-        "digital agency","logistics services"
-    ]
+# Oldfield sector mapping from current Companies House SIC codes.
+# We deliberately keep Business services narrower than the entire professional-services universe.
+BUSINESS_SERVICE_CODES = {
+    # Software / IT / data
+    "62011","62012","62020","62030","62090","63110","63120","63990",
+    # Management / technical consultancy
+    "70210","70229","71121","71122","71200","72110","72190",
+    # Marketing / design / specialist technical
+    "73110","73120","74100","74901","74909",
+    # Security / facilities / cleaning
+    "80100","80200","80300","81100","81210","81221","81222","81229","81291","81299",
+    # Office / business support
+    "82110","82190","82200","82301","82302","82920","82990",
 }
 
 def jread(path, default):
@@ -107,23 +108,72 @@ def momentum(emp_growth, na_growth, re_growth):
         + score(re_growth, [(5,5),(20,11),(50,18),(100,25)])
     )
 
-def classify(company, activity):
-    combined = f"{company or ''} {activity or ''}".lower()
-    for term in EXCLUDE:
-        if term in combined:
-            return "Excluded", term
-    for sector, terms in SECTORS.items():
-        if any(term in combined for term in terms):
-            return sector, None
-    return "Other / unknown", None
-
-def england_wales(company_number):
-    n = (company_number or "").upper()
-    return not n.startswith(("SC", "NI", "SO", "SL"))
-
 def company_no(filename):
     match = COMPANY_RE.search(filename)
     return match.group(1).upper() if match else None
+
+def company_number_is_england_wales(company_number):
+    n = (company_number or "").upper()
+    return not n.startswith(("SC", "NI", "SO", "SL"))
+
+def obvious_text_exclusion(company, activity):
+    combined = f"{company or ''} {activity or ''}".lower()
+    return next((term for term in NAME_ACTIVITY_EXCLUDE if term in combined), None)
+
+def oldfield_sector_from_sic(sic_codes):
+    cleaned = [str(x).zfill(5) for x in (sic_codes or []) if str(x).isdigit()]
+    for sic in cleaned:
+        n = int(sic)
+        if 10000 <= n <= 33999:
+            return "Manufacturing"
+    for sic in cleaned:
+        n = int(sic)
+        if 41000 <= n <= 43999:
+            return "Construction"
+    for sic in cleaned:
+        n = int(sic)
+        if 46000 <= n <= 46999:
+            return "Wholesale"
+    if any(sic in BUSINESS_SERVICE_CODES for sic in cleaned):
+        return "Business services"
+    return None
+
+def format_address(address):
+    if not address:
+        return None
+    ordered = [
+        address.get("premises"),
+        address.get("address_line_1"),
+        address.get("address_line_2"),
+        address.get("locality"),
+        address.get("region"),
+        address.get("postal_code"),
+        address.get("country"),
+    ]
+    parts = []
+    for value in ordered:
+        v = str(value or "").strip()
+        if v and v not in parts:
+            parts.append(v)
+    return ", ".join(parts) or None
+
+def profile_location(address):
+    if not address:
+        return None
+    locality = str(address.get("locality") or "").strip()
+    region = str(address.get("region") or "").strip()
+    if locality and region and locality.lower() != region.lower():
+        return f"{locality}, {region}"
+    return locality or region or str(address.get("country") or "").strip() or None
+
+def profile_is_england_wales(profile, company_number):
+    address = profile.get("registered_office_address") or {}
+    country = str(address.get("country") or "").strip().lower()
+    if country in {"scotland", "northern ireland"}:
+        return False
+    if country in {"england", "wales", "united kingdom", "great britain", "not specified", ""}:
+        return company_number_is_england_wales(company_number)
+    return company_number_is_england_wales(company_number)
 
 def parse_doc(raw, filename):
     root = etree.fromstring(raw, parser=etree.XMLParser(recover=True, huge_tree=True))
@@ -170,7 +220,7 @@ def parse_doc(raw, filename):
         ordered = sorted(dedup.items(), reverse=True)
         return (
             ordered[1][1] if len(ordered) > 1 else None,
-            ordered[0][1] if ordered else None
+            ordered[0][1] if ordered else None,
         )
 
     cn = company_no(filename)
@@ -200,38 +250,15 @@ def parse_doc(raw, filename):
     re_growth = growth(re_prev, re_cur)
     momentum_score = momentum(emp_growth, na_growth, re_growth)
 
-    sector, hard_exclusion = classify(company, activity)
-    ew_fit = england_wales(cn)
-
     scale = (
         (emp_cur is not None and emp_cur >= 10)
         or (na_cur is not None and na_cur >= 500000)
     )
-    strong_scale = (
-        (emp_cur is not None and emp_cur >= 20)
-        or (na_cur is not None and na_cur >= 1000000)
-    )
-
-    if not ew_fit:
-        gate_status, gate_reason, gate_basis = "auto_excluded", "Outside England & Wales", "geography"
-    elif hard_exclusion:
-        gate_status, gate_reason, gate_basis = "auto_excluded", f"Automatic exclusion matched: {hard_exclusion}", "hard_exclusion"
-    elif not scale:
-        gate_status, gate_reason, gate_basis = "hold", "Insufficient current scale evidence", "scale"
-    elif sector != "Other / unknown" and momentum_score >= 25:
-        gate_status, gate_reason, gate_basis = "research", f"{sector} + scale evidence + momentum", "target_sector"
-    elif sector == "Other / unknown" and strong_scale and momentum_score >= 85:
-        gate_status, gate_reason, gate_basis = "research", "Exceptional momentum and scale; sector needs manual confirmation", "unknown_sector"
-    else:
-        gate_status, gate_reason, gate_basis = "hold", "Insufficient sector or momentum evidence for morning research", "screen"
 
     return {
         "company": company,
         "company_number": cn,
         "period_end": period_end,
-        "location": "Location needs confirmation",
-        "postcode": None,
-        "registered_office": None,
         "directors": directors,
         "director_count": len(directors),
         "emp_prev": emp_prev,
@@ -246,17 +273,24 @@ def parse_doc(raw, filename):
         "momentum_score": momentum_score,
         "confidence": "High" if re_cur is not None else "Medium",
         "signal": "Strong momentum" if momentum_score >= 60 else "Momentum detected" if momentum_score >= 20 else "Low momentum",
-        "profile_sector": sector if sector != "Excluded" else "Other / unknown",
         "principal_activity": activity,
-        "ew_fit": ew_fit,
         "scale_fit": "£1m+ likely proxy" if scale else "Scale not evidenced",
         "scale_fit_bool": scale,
-        "owner_managed_proxy": bool(directors) and len(directors) <= 3,
-        "gate_status": gate_status,
-        "gate_reason": gate_reason,
-        "gate_basis": gate_basis,
-        "research_priority": momentum_score + (5 if sector in SECTORS else 0),
+        "research_priority": momentum_score,
     }
+
+def financial_prescreen(row):
+    if not row.get("company_number"):
+        return False, "Missing company number"
+    if not company_number_is_england_wales(row["company_number"]):
+        return False, "Outside England & Wales"
+    if obvious_text_exclusion(row.get("company"), row.get("principal_activity")):
+        return False, "Obvious activity exclusion"
+    if not row.get("scale_fit_bool"):
+        return False, "Insufficient current scale evidence"
+    if (row.get("momentum_score") or 0) < 25:
+        return False, "Insufficient momentum"
+    return True, "Financial pre-screen passed"
 
 def iter_docs(zf, info):
     raw = zf.read(info.filename)
@@ -301,15 +335,18 @@ def process_daily_zip(path, source_date):
             unique[key] = row
 
     unique_rows = list(unique.values())
-    retained = [r for r in unique_rows if r.get("gate_status") == "research"]
+    prescreen = []
+    for row in unique_rows:
+        ok, reason = financial_prescreen(row)
+        row["pre_screen_reason"] = reason
+        if ok:
+            prescreen.append(row)
 
-    return unique_rows, retained, {
+    return unique_rows, prescreen, {
         "filings": parsed_documents,
         "unique_companies": len(unique_rows),
         "parse_failures": parse_failures,
-        "screened_candidates": len(retained),
-        "research_candidates": len(retained),
-        "discarded_after_screen": max(0, len(unique_rows) - len(retained)),
+        "financial_prescreen_candidates": len(prescreen),
     }
 
 def discover(session):
@@ -340,6 +377,78 @@ def download(session, url, destination):
 
     partial.replace(destination)
 
+def fetch_company_profile(session, company_number, api_key):
+    url = PROFILE_URL.format(company_number=company_number)
+    for attempt in range(4):
+        response = session.get(url, auth=(api_key, ""), timeout=30)
+        if response.status_code == 200:
+            return response.json()
+        if response.status_code == 404:
+            return None
+        if response.status_code == 429:
+            time.sleep(3 * (attempt + 1))
+            continue
+        if response.status_code >= 500:
+            time.sleep(2 * (attempt + 1))
+            continue
+        response.raise_for_status()
+    raise RuntimeError(f"Companies House profile request repeatedly failed for {company_number}")
+
+def apply_current_profile(row, profile):
+    if not profile:
+        row["company_status"] = "not found"
+        row["profile_sector"] = None
+        row["sic_codes"] = []
+        row["integrity_flags"] = ["Current Companies House profile not found"]
+        row["profile_enriched_at_utc"] = datetime.now(timezone.utc).isoformat()
+        return row
+
+    address = profile.get("registered_office_address") or {}
+    row["company"] = profile.get("company_name") or row.get("company")
+    row["company_status"] = profile.get("company_status")
+    row["company_type"] = profile.get("type")
+    row["date_of_creation"] = profile.get("date_of_creation")
+    row["sic_codes"] = profile.get("sic_codes") or []
+    row["profile_sector"] = oldfield_sector_from_sic(row["sic_codes"])
+    row["registered_office"] = format_address(address)
+    row["location"] = profile_location(address)
+    row["postcode"] = address.get("postal_code")
+    row["registered_office_country"] = address.get("country")
+    row["previous_company_names"] = profile.get("previous_company_names") or []
+    row["profile_enriched_at_utc"] = datetime.now(timezone.utc).isoformat()
+    row["profile_source"] = "Companies House company profile API"
+
+    flags = []
+    if profile.get("registered_office_is_in_dispute"):
+        flags.append("Registered office is in dispute")
+    if profile.get("undeliverable_registered_office_address"):
+        flags.append("Registered office marked undeliverable")
+    row["integrity_flags"] = flags
+    return row
+
+def profile_eligibility(row):
+    if row.get("company_status") != "active":
+        return False, f"Company status is {row.get('company_status') or 'unknown'}"
+    if not company_number_is_england_wales(row.get("company_number")):
+        return False, "Outside England & Wales"
+    country = str(row.get("registered_office_country") or "").lower()
+    if country in {"scotland", "northern ireland"}:
+        return False, "Registered office outside England & Wales"
+    if not row.get("profile_sector"):
+        return False, "Current SIC codes are outside Oldfield target sectors"
+    if row.get("integrity_flags"):
+        return False, "Current Companies House profile has an address integrity flag"
+    return True, f"{row['profile_sector']} confirmed from current Companies House SIC code(s)"
+
+def needs_profile_refresh(row, today_date):
+    if not row.get("profile_enriched_at_utc") or not row.get("sic_codes") or not row.get("registered_office"):
+        return True
+    try:
+        enriched = datetime.fromisoformat(row["profile_enriched_at_utc"].replace("Z", "+00:00")).date()
+        return (today_date - enriched).days >= PROFILE_REFRESH_DAYS
+    except Exception:
+        return True
+
 def days_between(older, newer):
     try:
         return (date.fromisoformat(newer) - date.fromisoformat(older)).days
@@ -359,13 +468,50 @@ def archive_stale(master, latest_feed_date):
             archived += 1
     return archived
 
-def merge_enrichment(fresh, old):
+def merge_financial_refresh(fresh, old):
     if not old:
         return fresh
-    for key in ["location", "postcode", "registered_office", "profile_sector", "principal_activity", "directors"]:
-        if (not fresh.get(key) or fresh.get(key) in {"Location needs confirmation", "Other / unknown"}) and old.get(key):
+    for key in [
+        "location", "postcode", "registered_office", "profile_sector", "company_status",
+        "company_type", "date_of_creation", "sic_codes", "previous_company_names",
+        "profile_enriched_at_utc", "profile_source", "registered_office_country",
+        "integrity_flags"
+    ]:
+        if key in old and old.get(key) not in (None, "", [], {}):
             fresh[key] = old[key]
     return fresh
+
+def enrich_existing_master(master, session, api_key):
+    changed = 0
+    archived = 0
+    today_date = datetime.now(timezone.utc).date()
+
+    for company_number, row in list(master.items()):
+        if not needs_profile_refresh(row, today_date):
+            continue
+        profile = fetch_company_profile(session, company_number, api_key)
+        before = json.dumps(row, sort_keys=True, default=str)
+        apply_current_profile(row, profile)
+        eligible, reason = profile_eligibility(row)
+        row["gate_reason"] = reason
+        row["gate_basis"] = "current_company_profile"
+        if eligible:
+            row["gate_status"] = "research"
+            # Re-open only automatic archived records caused by missing/old profile data.
+            if row.get("archived_reason", "").startswith(("Current Companies House", "Company status", "Registered office", "Current SIC")):
+                row["candidate_state"] = "active"
+                row["archived_reason"] = None
+        else:
+            row["latest_screen_pass"] = False
+            if row.get("candidate_state") != "archived":
+                row["candidate_state"] = "archived"
+                row["archived_reason"] = reason
+                archived += 1
+        after = json.dumps(row, sort_keys=True, default=str)
+        if before != after:
+            changed += 1
+
+    return changed, archived
 
 def write(master_rows, status, processed):
     ordered = sorted(
@@ -374,7 +520,7 @@ def write(master_rows, status, processed):
             x.get("candidate_state") == "archived",
             -(x.get("research_priority") or 0),
             -(x.get("momentum_score") or 0),
-            x.get("company", "").lower()
+            x.get("company", "").lower(),
         )
     )
 
@@ -390,6 +536,13 @@ def main():
     parser.add_argument("--source-date")
     args = parser.parse_args()
 
+    api_key = os.environ.get("COMPANIES_HOUSE_API_KEY", "").strip()
+    if not api_key:
+        raise SystemExit(
+            "COMPANIES_HOUSE_API_KEY is required. Add it as a GitHub Actions repository secret "
+            "so current SIC, status and registered-office data can be enriched before prospects are retained."
+        )
+
     existing = jread(PROS, [])
     status = jread(STATUS, {})
     processed = jread(PROCESSED, [])
@@ -398,12 +551,19 @@ def main():
     latest_processed = max(processed_dates) if processed_dates else status.get("latest_processed_date")
 
     session = requests.Session()
-    session.headers["User-Agent"] = "OldfieldAdvisoryProspectIntelligence/2.0 public bulk-data refresh"
+    session.headers["User-Agent"] = "OldfieldAdvisoryProspectIntelligence/3.0"
+
+    master = {p["company_number"]: p for p in existing if p.get("company_number")}
 
     if args.local_zip:
         if not args.source_date:
             raise SystemExit("--source-date required with --local-zip")
-        queue = [{"name": Path(args.local_zip).name, "date": args.source_date, "url": None, "local": Path(args.local_zip)}]
+        queue = [{
+            "name": Path(args.local_zip).name,
+            "date": args.source_date,
+            "url": None,
+            "local": Path(args.local_zip),
+        }]
     else:
         files = discover(session)
         queue = [
@@ -414,40 +574,65 @@ def main():
         if latest_processed is None and queue:
             queue = [queue[-1]]
 
-    if not queue:
-        print("No newer Companies House daily ZIP is available.")
-        return 0
-
-    master = {p["company_number"]: p for p in existing if p.get("company_number")}
     tmp = ROOT / ".tmp_downloads"
     tmp.mkdir(exist_ok=True)
 
-    for item in queue:
-        if item["date"] in processed_dates:
-            continue
+    total_new = 0
+    total_refreshed = 0
+    total_archived_by_profile = 0
+    latest_item = None
+    latest_summary = None
 
+    for item in queue:
+        latest_item = item
         path = item.get("local") or tmp / item["name"]
+
         if not item.get("local"):
             print("Downloading", item["name"])
             download(session, item["url"], path)
 
         print("Processing", item["name"])
-        all_rows, qualifying_rows, summary = process_daily_zip(path, item["date"])
+        all_rows, prescreen_rows, summary = process_daily_zip(path, item["date"])
+        latest_summary = summary
 
         all_by_company = {r["company_number"]: r for r in all_rows}
         for company_number, old in master.items():
             if company_number in all_by_company:
                 old["last_filing_seen_date"] = item["date"]
-                old["latest_screen_pass"] = all_by_company[company_number].get("gate_status") == "research"
 
         new_candidates = 0
         refreshed_candidates = 0
+        sector_rejected = 0
+        inactive_rejected = 0
+        integrity_rejected = 0
 
-        for fresh in qualifying_rows:
+        for fresh in prescreen_rows:
             company_number = fresh["company_number"]
             old = master.get(company_number)
+            fresh = merge_financial_refresh(fresh, old)
 
-            fresh = merge_enrichment(fresh, old)
+            profile = fetch_company_profile(session, company_number, api_key)
+            apply_current_profile(fresh, profile)
+            eligible, reason = profile_eligibility(fresh)
+
+            if not eligible:
+                if "status" in reason.lower():
+                    inactive_rejected += 1
+                elif "integrity" in reason.lower():
+                    integrity_rejected += 1
+                else:
+                    sector_rejected += 1
+                # Existing prospects are retained as archive/history rather than deleted.
+                if old:
+                    old.update(fresh)
+                    old["candidate_state"] = "archived"
+                    old["archived_reason"] = reason
+                    old["gate_status"] = "research"
+                    old["gate_reason"] = reason
+                    old["latest_screen_pass"] = False
+                    master[company_number] = old
+                continue
+
             fresh["first_seen_feed_date"] = old.get("first_seen_feed_date") if old else item["date"]
             fresh["last_triggered_feed_date"] = item["date"]
             fresh["last_filing_seen_date"] = item["date"]
@@ -455,6 +640,10 @@ def main():
             fresh["candidate_state"] = "active"
             fresh["archived_reason"] = None
             fresh["latest_screen_pass"] = True
+            fresh["gate_status"] = "research"
+            fresh["gate_reason"] = reason
+            fresh["gate_basis"] = "current_company_profile"
+            fresh["research_priority"] = (fresh.get("momentum_score") or 0) + 10
 
             if old:
                 refreshed_candidates += 1
@@ -464,8 +653,6 @@ def main():
             master[company_number] = fresh
 
         newly_archived = archive_stale(master, item["date"])
-        active_total = sum(1 for p in master.values() if p.get("candidate_state") != "archived")
-        archived_total = sum(1 for p in master.values() if p.get("candidate_state") == "archived")
 
         entry = {
             "date": item["date"],
@@ -473,51 +660,73 @@ def main():
             **summary,
             "new_candidates": new_candidates,
             "refreshed_candidates": refreshed_candidates,
+            "sector_or_geo_rejected_after_profile": sector_rejected,
+            "inactive_rejected_after_profile": inactive_rejected,
+            "integrity_rejected_after_profile": integrity_rejected,
             "newly_archived": newly_archived,
-            "retained_master_total": len(master),
-            "active_candidate_total": active_total,
-            "archived_candidate_total": archived_total,
             "status": "processed",
             "processed_at_utc": datetime.now(timezone.utc).isoformat(),
         }
         processed.append(entry)
         processed_dates.add(item["date"])
 
-        status.update({
-            "automation_enabled": True,
-            "source_name": "Companies House Free Accounts Data Product",
-            "source_index_url": INDEX_URL,
-            "latest_processed_date": item["date"],
-            "latest_processed_file": item["name"],
-            "latest_source_filings": summary["filings"],
-            "latest_unique_companies": summary["unique_companies"],
-            "latest_screened_candidates": summary["screened_candidates"],
-            "latest_candidates_total": summary["research_candidates"],
-            "latest_research_candidates": summary["research_candidates"],
-            "latest_new_candidates": new_candidates,
-            "latest_refreshed_candidates": refreshed_candidates,
-            "latest_discarded_after_screen": summary["discarded_after_screen"],
-            "latest_newly_archived": newly_archived,
-            "retained_master_total": len(master),
-            "active_candidate_total": active_total,
-            "archived_candidate_total": archived_total,
-            "retention_rule_days": RETENTION_DAYS,
-            "processed_files": processed[-30:],
-            "last_run_result": (
-                f"Processed {item['name']}: {summary['filings']:,} filing documents, "
-                f"{new_candidates} new prospect candidates, {refreshed_candidates} refreshed, "
-                f"{summary['discarded_after_screen']:,} discarded after the automatic screen. "
-                "Raw filing records were not retained."
-            ),
-            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        })
-
-        write(list(master.values()), status, processed)
+        total_new += new_candidates
+        total_refreshed += refreshed_candidates
+        total_archived_by_profile += sector_rejected + inactive_rejected + integrity_rejected
 
         if not item.get("local"):
             path.unlink(missing_ok=True)
 
         print(json.dumps(entry, indent=2))
+
+    # Backfill or refresh current profile fields for the existing retained master,
+    # even when there is no newer daily ZIP. This is what fixes the current live 75.
+    backfilled, backfill_archived = enrich_existing_master(master, session, api_key)
+
+    active_total = sum(1 for p in master.values() if p.get("candidate_state") != "archived")
+    archived_total = sum(1 for p in master.values() if p.get("candidate_state") == "archived")
+
+    if latest_item and latest_summary:
+        status.update({
+            "latest_processed_date": latest_item["date"],
+            "latest_processed_file": latest_item["name"],
+            "latest_source_filings": latest_summary["filings"],
+            "latest_unique_companies": latest_summary["unique_companies"],
+            "latest_screened_candidates": latest_summary["financial_prescreen_candidates"],
+            "latest_candidates_total": total_new + total_refreshed,
+            "latest_research_candidates": total_new + total_refreshed,
+            "latest_new_candidates": total_new,
+            "latest_refreshed_candidates": total_refreshed,
+            "latest_discarded_after_screen": max(
+                0,
+                latest_summary["unique_companies"] - latest_summary["financial_prescreen_candidates"]
+            ),
+        })
+
+    status.update({
+        "automation_enabled": True,
+        "source_name": "Companies House daily accounts + current company profile API",
+        "source_index_url": INDEX_URL,
+        "profile_enrichment_enabled": True,
+        "profile_backfilled_or_refreshed": backfilled,
+        "profile_archived_after_enrichment": backfill_archived + total_archived_by_profile,
+        "retained_master_total": len(master),
+        "active_candidate_total": active_total,
+        "archived_candidate_total": archived_total,
+        "retention_rule_days": RETENTION_DAYS,
+        "processed_files": processed[-30:],
+        "last_run_result": (
+            f"Feed refresh complete. {total_new} new prospects, {total_refreshed} refreshed. "
+            f"{backfilled} existing records had current Companies House profile data backfilled/refreshed. "
+            "Location, status and sector now come from the current company profile rather than filing-text inference."
+        ),
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+    })
+
+    write(list(master.values()), status, processed)
+
+    if not queue:
+        print("No newer daily ZIP. Current-profile enrichment/backfill still completed.")
 
     return 0
 
