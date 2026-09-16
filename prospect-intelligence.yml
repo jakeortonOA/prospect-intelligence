@@ -1,12 +1,8 @@
 name: Prospect Intelligence
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
   schedule:
-    # Companies House normally publishes the daily accounts file Tue-Sat.
-    # Check repeatedly so a late publication is picked up without human intervention.
     - cron: '17 8-15 * * 2-6'
       timezone: 'Europe/London'
 
@@ -23,15 +19,17 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 50
+    env:
+      COMPANIES_HOUSE_API_KEY: ${{ secrets.COMPANIES_HOUSE_API_KEY }}
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: 'pip'
@@ -39,26 +37,50 @@ jobs:
       - name: Install parser dependencies
         run: pip install -r requirements.txt
 
-      - name: Check Companies House for any newer daily ZIP
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-        run: python scripts/refresh_companies_house.py
-
-      - name: Persist refreshed feed state
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+      - name: Validate Companies House API key
         shell: bash
         run: |
-          if git diff --quiet -- data; then
-            echo "No newer Companies House daily file was available."
+          if [ -z "$COMPANIES_HOUSE_API_KEY" ]; then
+            echo "Missing repository secret: COMPANIES_HOUSE_API_KEY"
+            echo "Add it under Settings > Secrets and variables > Actions > New repository secret."
+            exit 1
+          fi
+
+      - name: Reconstruct app folders
+        shell: bash
+        run: |
+          mkdir -p scripts data
+          cp refresh_companies_house.py scripts/refresh_companies_house.py
+          cp feed_status.js data/feed_status.js
+          cp feed_status.json data/feed_status.json
+          cp processed_feeds.json data/processed_feeds.json
+          cp prospects.js data/prospects.js
+          cp prospects.json data/prospects.json
+
+      - name: Refresh and enrich Companies House prospect feed
+        run: python scripts/refresh_companies_house.py
+
+      - name: Persist refreshed prospect master
+        shell: bash
+        run: |
+          cp data/feed_status.js feed_status.js
+          cp data/feed_status.json feed_status.json
+          cp data/processed_feeds.json processed_feeds.json
+          cp data/prospects.js prospects.js
+          cp data/prospects.json prospects.json
+
+          if git diff --quiet -- feed_status.js feed_status.json processed_feeds.json prospects.js prospects.json; then
+            echo "No prospect-data changes to commit."
           else
             git config user.name "Oldfield Prospect Intelligence"
             git config user.email "prospect-intelligence@users.noreply.github.com"
-            git add data/
-            git commit -m "Refresh Companies House prospect feed"
+            git add feed_status.js feed_status.json processed_feeds.json prospects.js prospects.json
+            git commit -m "Refresh and enrich Companies House prospect feed"
             git pull --rebase origin main
             git push origin HEAD:main
           fi
 
-      - name: Build static site artifact
+      - name: Build GitHub Pages artifact
         shell: bash
         run: |
           rm -rf _site
