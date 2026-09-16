@@ -19,15 +19,17 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 50
+    env:
+      COMPANIES_HOUSE_API_KEY: ${{ secrets.COMPANIES_HOUSE_API_KEY }}
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
           cache: 'pip'
@@ -46,7 +48,7 @@ jobs:
           cp prospects.js data/prospects.js
           cp prospects.json data/prospects.json
 
-      - name: Refresh Companies House prospect feed
+      - name: Refresh and enrich Companies House prospect feed
         run: python scripts/refresh_companies_house.py
 
       - name: Persist refreshed feed state
@@ -102,3 +104,4 @@ jobs:
       - name: Deploy Prospect Intelligence
         id: deployment
         uses: actions/deploy-pages@v4
+
