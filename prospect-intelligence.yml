@@ -24,27 +24,18 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
           cache: 'pip'
 
       - name: Install parser dependencies
         run: pip install -r requirements.txt
-
-      - name: Validate Companies House API key
-        shell: bash
-        run: |
-          if [ -z "$COMPANIES_HOUSE_API_KEY" ]; then
-            echo "Missing repository secret: COMPANIES_HOUSE_API_KEY"
-            echo "Add it under Settings > Secrets and variables > Actions > New repository secret."
-            exit 1
-          fi
 
       - name: Reconstruct app folders
         shell: bash
@@ -60,7 +51,7 @@ jobs:
       - name: Refresh and enrich Companies House prospect feed
         run: python scripts/refresh_companies_house.py
 
-      - name: Persist refreshed prospect master
+      - name: Persist refreshed feed state
         shell: bash
         run: |
           cp data/feed_status.js feed_status.js
@@ -70,12 +61,12 @@ jobs:
           cp data/prospects.json prospects.json
 
           if git diff --quiet -- feed_status.js feed_status.json processed_feeds.json prospects.js prospects.json; then
-            echo "No prospect-data changes to commit."
+            echo "No Companies House data changes to commit."
           else
             git config user.name "Oldfield Prospect Intelligence"
             git config user.email "prospect-intelligence@users.noreply.github.com"
             git add feed_status.js feed_status.json processed_feeds.json prospects.js prospects.json
-            git commit -m "Refresh and enrich Companies House prospect feed"
+            git commit -m "Refresh Companies House prospect feed"
             git pull --rebase origin main
             git push origin HEAD:main
           fi
