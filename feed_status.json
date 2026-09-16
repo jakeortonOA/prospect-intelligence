@@ -36,8 +36,8 @@
       "processed_at_utc": "2026-09-16T13:26:35.052736+00:00"
     }
   ],
-  "last_run_result": "Feed refresh complete. 0 new prospects, 0 refreshed. 75 existing records had current Companies House profile data backfilled/refreshed. Location, status and sector now come from the current company profile rather than filing-text inference.",
-  "generated_at_utc": "2026-09-16T14:27:07.301456+00:00",
+  "last_run_result": "Feed refresh complete. 0 new prospects, 0 refreshed. 0 existing records had current Companies House profile data backfilled/refreshed. Location, status and sector now come from the current company profile rather than filing-text inference.",
+  "generated_at_utc": "2026-09-16T18:13:36.685655+00:00",
   "latest_screened_candidates": 33,
   "latest_unique_companies": 12753,
   "latest_new_candidates": 33,
@@ -49,6 +49,6 @@
   "retention_rule_days": 30,
   "latest_newly_archived": 0,
   "profile_enrichment_enabled": true,
-  "profile_backfilled_or_refreshed": 75,
-  "profile_archived_after_enrichment": 16
+  "profile_backfilled_or_refreshed": 0,
+  "profile_archived_after_enrichment": 0
 }
