@@ -25,6 +25,9 @@ PROCESSED = DATA / "processed_feeds.json"
 
 INDEX_URL = "https://download.companieshouse.gov.uk/en_accountsdata.html"
 PROFILE_URL = "https://api.company-information.service.gov.uk/company/{company_number}"
+PSC_URL = "https://api.company-information.service.gov.uk/company/{company_number}/persons-with-significant-control"
+OFFICERS_URL = "https://api.company-information.service.gov.uk/company/{company_number}/officers"
+API_REQUEST_DELAY = 0.55
 FILE_RE = re.compile(r'href=["\']([^"\']*Accounts_Bulk_Data-(\d{4}-\d{2}-\d{2})\.zip)["\']', re.I)
 COMPANY_RE = re.compile(r'_((?:SC|NI|OC|SO|LP|SL|FC|NF|NL|IP|SP|RS)?[A-Z0-9]{5,8})_(\d{8})(?:\.|_)', re.I)
 
@@ -377,22 +380,236 @@ def download(session, url, destination):
 
     partial.replace(destination)
 
-def fetch_company_profile(session, company_number, api_key):
-    url = PROFILE_URL.format(company_number=company_number)
-    for attempt in range(4):
-        response = session.get(url, auth=(api_key, ""), timeout=30)
+def fetch_company_endpoint(session, url, api_key, params=None, not_found=None):
+    for attempt in range(6):
+        response = session.get(url, auth=(api_key, ""), params=params, timeout=30)
+        time.sleep(API_REQUEST_DELAY)
         if response.status_code == 200:
             return response.json()
         if response.status_code == 404:
-            return None
+            return not_found
         if response.status_code == 429:
-            time.sleep(3 * (attempt + 1))
+            # Stay conservative with the public API rate limit rather than repeatedly hammering it.
+            time.sleep(15 * (attempt + 1))
             continue
         if response.status_code >= 500:
-            time.sleep(2 * (attempt + 1))
+            time.sleep(3 * (attempt + 1))
             continue
         response.raise_for_status()
-    raise RuntimeError(f"Companies House profile request repeatedly failed for {company_number}")
+    raise RuntimeError(f"Companies House API request repeatedly failed: {url}")
+
+def fetch_company_profile(session, company_number, api_key):
+    return fetch_company_endpoint(
+        session,
+        PROFILE_URL.format(company_number=company_number),
+        api_key,
+        not_found=None,
+    )
+
+def fetch_company_psc(session, company_number, api_key):
+    return fetch_company_endpoint(
+        session,
+        PSC_URL.format(company_number=company_number),
+        api_key,
+        params={"items_per_page": 100},
+        not_found={"items": []},
+    ) or {"items": []}
+
+def fetch_company_officers(session, company_number, api_key):
+    return fetch_company_endpoint(
+        session,
+        OFFICERS_URL.format(company_number=company_number),
+        api_key,
+        params={"items_per_page": 100},
+        not_found={"items": []},
+    ) or {"items": []}
+
+def year_end_from_profile(profile):
+    accounts = (profile or {}).get("accounts") or {}
+    ard = accounts.get("accounting_reference_date") or {}
+    day = ard.get("day")
+    month = ard.get("month")
+    try:
+        day = int(day) if day is not None else None
+        month = int(month) if month is not None else None
+    except Exception:
+        day, month = None, None
+    if not month or month < 1 or month > 12:
+        return None, None, None
+    month_names = [
+        None, "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December"
+    ]
+    label = f"{day} {month_names[month]}" if day else month_names[month]
+    return day, month, label
+
+def person_name_tokens(name):
+    cleaned = re.sub(r"[^a-z0-9 ]+", " ", str(name or "").lower())
+    stop = {"mr", "mrs", "miss", "ms", "dr", "sir", "dame", "prof", "professor"}
+    return [x for x in cleaned.split() if x and x not in stop]
+
+def names_match(a, b):
+    aa, bb = person_name_tokens(a), person_name_tokens(b)
+    if not aa or not bb:
+        return False
+    sa, sb = set(aa), set(bb)
+    if sa == sb:
+        return True
+    overlap = sa & sb
+    return len(overlap) >= 2 and (aa[-1] in sb or bb[-1] in sa)
+
+def control_strength(natures):
+    score = 0
+    for nature in natures or []:
+        n = str(nature).lower()
+        if "75-to-100-percent" in n:
+            score = max(score, 100)
+        elif "50-to-75-percent" in n:
+            score = max(score, 90)
+        elif "25-to-50-percent" in n:
+            score = max(score, 70)
+        elif "appoint-and-remove-directors" in n:
+            score = max(score, 85)
+        elif "significant-influence-or-control" in n:
+            score = max(score, 60)
+        else:
+            score = max(score, 40)
+    return score
+
+def friendly_control(natures):
+    labels = []
+    for nature in natures or []:
+        n = str(nature).lower()
+        label = None
+        if "ownership-of-shares-75-to-100-percent" in n:
+            label = "Shares: 75-100%"
+        elif "ownership-of-shares-50-to-75-percent" in n:
+            label = "Shares: 50-75%"
+        elif "ownership-of-shares-25-to-50-percent" in n:
+            label = "Shares: 25-50%"
+        elif "voting-rights-75-to-100-percent" in n:
+            label = "Voting rights: 75-100%"
+        elif "voting-rights-50-to-75-percent" in n:
+            label = "Voting rights: 50-75%"
+        elif "voting-rights-25-to-50-percent" in n:
+            label = "Voting rights: 25-50%"
+        elif "appoint-and-remove-directors" in n:
+            label = "Can appoint/remove directors"
+        elif "significant-influence-or-control" in n:
+            label = "Significant influence/control"
+        if label and label not in labels:
+            labels.append(label)
+    return labels
+
+def simplify_psc(payload):
+    out = []
+    for item in (payload or {}).get("items") or []:
+        if item.get("ceased_on"):
+            continue
+        kind = str(item.get("kind") or "")
+        name = item.get("name")
+        if not name:
+            elements = item.get("name_elements") or {}
+            name = " ".join(
+                str(elements.get(k) or "").strip()
+                for k in ("forename", "middle_name", "surname")
+                if str(elements.get(k) or "").strip()
+            ) or None
+        if not name:
+            continue
+        natures = item.get("natures_of_control") or []
+        out.append({
+            "name": name,
+            "kind": kind,
+            "is_individual": "individual" in kind,
+            "natures_of_control": natures,
+            "control_summary": friendly_control(natures),
+            "control_score": control_strength(natures),
+            "notified_on": item.get("notified_on"),
+        })
+    return sorted(out, key=lambda x: (-x.get("control_score", 0), x.get("name", "")))
+
+def simplify_directors(payload):
+    out = []
+    for item in (payload or {}).get("items") or []:
+        if item.get("resigned_on"):
+            continue
+        role = str(item.get("officer_role") or "").lower()
+        if role not in {"director", "corporate-director"}:
+            continue
+        name = item.get("name")
+        if not name:
+            continue
+        out.append({
+            "name": name,
+            "role": role,
+            "is_individual": role == "director",
+            "appointed_on": item.get("appointed_on"),
+        })
+    return sorted(out, key=lambda x: (x.get("appointed_on") or "9999-99-99", x.get("name", "")))
+
+def choose_primary_contact(controllers, directors):
+    individual_directors = [d for d in directors if d.get("is_individual")]
+    candidates = []
+    for controller in controllers:
+        if not controller.get("is_individual"):
+            continue
+        matched = next((d for d in individual_directors if names_match(controller.get("name"), d.get("name"))), None)
+        contact_score = int(controller.get("control_score") or 0) + (25 if matched else 0)
+        candidates.append((contact_score, controller, matched))
+
+    if candidates:
+        _, controller, matched = max(candidates, key=lambda x: x[0])
+        summary = controller.get("control_summary") or []
+        both = matched is not None
+        confidence = "High" if both or (controller.get("control_score") or 0) >= 90 else "Medium"
+        return {
+            "name": controller.get("name"),
+            "role": "PSC + active director" if both else "Person with significant control",
+            "confidence": confidence,
+            "is_psc": True,
+            "is_director": both,
+            "control_summary": summary,
+            "basis": (
+                "Individual PSC also appears on the current active-director list."
+                if both else
+                "Highest-control individual PSC on the current Companies House record."
+            ),
+        }
+
+    if individual_directors:
+        director = individual_directors[0]
+        corporate_controller = next((c for c in controllers if not c.get("is_individual")), None)
+        return {
+            "name": director.get("name"),
+            "role": "Active director",
+            "confidence": "Low",
+            "is_psc": False,
+            "is_director": True,
+            "control_summary": [],
+            "basis": (
+                f"No individual PSC identified; control is recorded against {corporate_controller.get('name')}. "
+                "Using an active director as the best available contact proxy."
+                if corporate_controller else
+                "No individual PSC identified; using the longest-standing active director as a contact proxy."
+            ),
+        }
+    return None
+
+def apply_control_data(row, psc_payload, officers_payload):
+    controllers = simplify_psc(psc_payload)
+    directors = simplify_directors(officers_payload)
+    contact = choose_primary_contact(controllers, directors)
+    row["controllers"] = controllers
+    row["active_directors"] = directors
+    row["primary_contact"] = contact
+    row["primary_contact_name"] = contact.get("name") if contact else None
+    row["primary_contact_role"] = contact.get("role") if contact else None
+    row["primary_contact_confidence"] = contact.get("confidence") if contact else None
+    row["primary_contact_basis"] = contact.get("basis") if contact else None
+    row["primary_contact_checked_at_utc"] = datetime.now(timezone.utc).isoformat()
+    row["ownership_source"] = "Companies House PSC + officer APIs"
+    return row
 
 def apply_current_profile(row, profile):
     if not profile:
@@ -415,6 +632,10 @@ def apply_current_profile(row, profile):
     row["postcode"] = address.get("postal_code")
     row["registered_office_country"] = address.get("country")
     row["previous_company_names"] = profile.get("previous_company_names") or []
+    year_end_day, year_end_month, year_end_label = year_end_from_profile(profile)
+    row["year_end_day"] = year_end_day
+    row["year_end_month"] = year_end_month
+    row["year_end_label"] = year_end_label
     row["profile_enriched_at_utc"] = datetime.now(timezone.utc).isoformat()
     row["profile_source"] = "Companies House company profile API"
 
@@ -441,10 +662,24 @@ def profile_eligibility(row):
     return True, f"{row['profile_sector']} confirmed from current Companies House SIC code(s)"
 
 def needs_profile_refresh(row, today_date):
-    if not row.get("profile_enriched_at_utc") or not row.get("sic_codes") or not row.get("registered_office"):
+    if (
+        not row.get("profile_enriched_at_utc")
+        or not row.get("sic_codes")
+        or not row.get("registered_office")
+        or "year_end_month" not in row
+    ):
         return True
     try:
         enriched = datetime.fromisoformat(row["profile_enriched_at_utc"].replace("Z", "+00:00")).date()
+        return (today_date - enriched).days >= PROFILE_REFRESH_DAYS
+    except Exception:
+        return True
+
+def needs_control_refresh(row, today_date):
+    if "controllers" not in row or "active_directors" not in row or not row.get("primary_contact_checked_at_utc"):
+        return True
+    try:
+        enriched = datetime.fromisoformat(row["primary_contact_checked_at_utc"].replace("Z", "+00:00")).date()
         return (today_date - enriched).days >= PROFILE_REFRESH_DAYS
     except Exception:
         return True
@@ -474,8 +709,11 @@ def merge_financial_refresh(fresh, old):
     for key in [
         "location", "postcode", "registered_office", "profile_sector", "company_status",
         "company_type", "date_of_creation", "sic_codes", "previous_company_names",
+        "year_end_day", "year_end_month", "year_end_label",
         "profile_enriched_at_utc", "profile_source", "registered_office_country",
-        "integrity_flags"
+        "integrity_flags", "controllers", "active_directors", "primary_contact",
+        "primary_contact_name", "primary_contact_role", "primary_contact_confidence",
+        "primary_contact_basis", "primary_contact_checked_at_utc", "ownership_source"
     ]:
         if key in old and old.get(key) not in (None, "", [], {}):
             fresh[key] = old[key]
@@ -487,15 +725,25 @@ def enrich_existing_master(master, session, api_key):
     today_date = datetime.now(timezone.utc).date()
 
     for company_number, row in list(master.items()):
-        if not needs_profile_refresh(row, today_date):
+        profile_due = needs_profile_refresh(row, today_date)
+        control_due = needs_control_refresh(row, today_date)
+        if not profile_due and not control_due:
             continue
-        profile = fetch_company_profile(session, company_number, api_key)
+
         before = json.dumps(row, sort_keys=True, default=str)
-        apply_current_profile(row, profile)
+        if profile_due:
+            profile = fetch_company_profile(session, company_number, api_key)
+            apply_current_profile(row, profile)
+
         eligible, reason = profile_eligibility(row)
         row["gate_reason"] = reason
         row["gate_basis"] = "current_company_profile"
+
         if eligible:
+            if control_due:
+                psc_payload = fetch_company_psc(session, company_number, api_key)
+                officers_payload = fetch_company_officers(session, company_number, api_key)
+                apply_control_data(row, psc_payload, officers_payload)
             row["gate_status"] = "research"
             # Re-open only automatic archived records caused by missing/old profile data.
             if (row.get("archived_reason") or "").startswith(("Current Companies House", "Company status", "Registered office", "Current SIC")):
@@ -507,6 +755,7 @@ def enrich_existing_master(master, session, api_key):
                 row["candidate_state"] = "archived"
                 row["archived_reason"] = reason
                 archived += 1
+
         after = json.dumps(row, sort_keys=True, default=str)
         if before != after:
             changed += 1
@@ -551,7 +800,7 @@ def main():
     latest_processed = max(processed_dates) if processed_dates else status.get("latest_processed_date")
 
     session = requests.Session()
-    session.headers["User-Agent"] = "OldfieldAdvisoryProspectIntelligence/3.0"
+    session.headers["User-Agent"] = "OldfieldAdvisoryProspectIntelligence/3.1"
 
     master = {p["company_number"]: p for p in existing if p.get("company_number")}
 
@@ -632,6 +881,10 @@ def main():
                     old["latest_screen_pass"] = False
                     master[company_number] = old
                 continue
+
+            psc_payload = fetch_company_psc(session, company_number, api_key)
+            officers_payload = fetch_company_officers(session, company_number, api_key)
+            apply_control_data(fresh, psc_payload, officers_payload)
 
             fresh["first_seen_feed_date"] = old.get("first_seen_feed_date") if old else item["date"]
             fresh["last_triggered_feed_date"] = item["date"]
@@ -717,8 +970,9 @@ def main():
         "processed_files": processed[-30:],
         "last_run_result": (
             f"Feed refresh complete. {total_new} new prospects, {total_refreshed} refreshed. "
-            f"{backfilled} existing records had current Companies House profile data backfilled/refreshed. "
-            "Location, status and sector now come from the current company profile rather than filing-text inference."
+            f"{backfilled} existing records had Companies House identity / ownership data backfilled or refreshed. "
+            "Location, status, sector and accounting year end come from the current company profile; "
+            "principal-contact suggestions come from current PSC and officer records."
         ),
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
     })
