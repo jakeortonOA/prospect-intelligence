@@ -295,8 +295,34 @@ const MONTH_NAMES=['','January','February','March','April','May','June','July','
 function yearEndMonth(d){if(+d.year_end_month>=1&&+d.year_end_month<=12)return +d.year_end_month;const p=String(d.period_end||'').match(/^\d{4}-(\d{2})-\d{2}$/);return p?+p[1]:0}
 function yearEndLabel(d){if(d.year_end_label)return d.year_end_label;const m=yearEndMonth(d);if(!m)return 'Pending';const p=String(d.period_end||'').match(/^\d{4}-\d{2}-(\d{2})$/);return p?`${+p[1]} ${MONTH_NAMES[m]}`:MONTH_NAMES[m]}
 function yearEndShort(d){const m=yearEndMonth(d);return m?MONTH_NAMES[m].slice(0,3):'Pending'}
-function personLinkedInUrl(d){const n=(d.primary_contact_name||'').trim();if(!n)return '';return 'https://www.google.com/search?q='+encodeURIComponent('site:linkedin.com/in "'+n+'" "'+d.company+'"')}
-function personWebUrl(d){const n=(d.primary_contact_name||'').trim();if(!n)return '';return 'https://www.google.com/search?q='+encodeURIComponent('"'+n+'" "'+d.company+'"')}
+function contactSearchName(name){
+ const raw=(name||'').replace(/\s+/g,' ').trim();
+ if(!raw)return '';
+ const stripped=raw.replace(/^(mr|mrs|ms|miss|dr|prof|professor|sir|dame|lord|lady|rev|reverend)\.?\s+/i,'').trim();
+ const parts=stripped.split(' ').filter(Boolean);
+ return parts.length>=2?`${parts[0]} ${parts[parts.length-1]}`:stripped;
+}
+function companySearchName(name){
+ return (name||'').replace(/[.,]/g,' ').replace(/\b(limited|ltd|plc|llp|lp)\b/gi,' ').replace(/\s+/g,' ').trim();
+}
+function contactSearchLocation(d){
+ const loc=(d.location||'').split(',')[0].trim();
+ return loc&& !/pending|confirm/i.test(loc)?loc:'';
+}
+function personLinkedInUrl(d){
+ const n=contactSearchName(d.primary_contact_name);if(!n)return '';
+ const c=companySearchName(d.company);
+ const l=contactSearchLocation(d);
+ const q=[n,c,l,'LinkedIn'].filter(Boolean).join(' ');
+ return 'https://www.google.com/search?q='+encodeURIComponent(q);
+}
+function personWebUrl(d){
+ const n=contactSearchName(d.primary_contact_name);if(!n)return '';
+ const c=companySearchName(d.company);
+ const l=contactSearchLocation(d);
+ const q=[n,c,l].filter(Boolean).join(' ');
+ return 'https://www.google.com/search?q='+encodeURIComponent(q);
+}
 function contactCard(d){const c=d.primary_contact;if(!c||!c.name)return `<div class="card primary-contact-card"><div class="card-head"><b>Likely principal contact</b><span>PSC + officer intelligence</span></div><div class="card-body"><div class="contact-basis" style="margin-top:0">No suitable individual controller has been identified automatically. Review the current PSCs and active directors below before outreach.</div></div></div>`;const controls=(c.control_summary||[]),li=personLinkedInUrl(d),web=personWebUrl(d);return `<div class="card primary-contact-card"><div class="card-head"><b>Likely principal contact</b><span>Companies House PSC + officer data</span></div><div class="card-body"><div class="contact-hero"><div><div class="contact-name">${esc(c.name)}</div><div class="contact-role">${esc(c.role||'Suggested contact')}</div></div><span class="contact-confidence">${esc(c.confidence||'Review')} confidence</span></div>${controls.length?`<div class="contact-control">${controls.map(x=>`<span class="control-chip">${esc(x)}</span>`).join('')}</div>`:''}<div class="contact-basis">${esc(c.basis||'Suggested from current Companies House control and officer records.')}</div><div class="contact-actions">${li?`<a class="btn primary" href="${li}" target="_blank">LinkedIn person ↗</a>`:''}${web?`<a class="btn" href="${web}" target="_blank">Web search person ↗</a>`:''}</div><div class="tiny" style="margin-top:10px">PSC records indicate significant control, not an exact shareholder register. Treat this as a contact lead for verification.</div></div></div>`}
 function stateFor(d){return workflow[idOf(d)]||{status:d.gate_status,reason:'',checks:{},website:'',notes:'',outreachStatus:'Ready to contact'}}
 function effectiveStatus(d){return stateFor(d).status||d.gate_status}
