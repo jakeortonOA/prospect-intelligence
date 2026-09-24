@@ -132,8 +132,8 @@
       "processed_at_utc": "2026-09-24T12:59:08.141238+00:00"
     }
   ],
-  "last_run_result": "Feed refresh complete. 264 new prospects, 0 refreshed. 0 existing records had Companies House identity / ownership data backfilled or refreshed. Location, status, sector and accounting year end come from the current company profile; principal-contact suggestions come from current PSC and officer records.",
-  "generated_at_utc": "2026-09-24T12:59:08.152108+00:00",
+  "last_run_result": "Feed refresh complete. 0 new prospects, 0 refreshed. 0 existing records had Companies House identity / ownership data backfilled or refreshed. Location, status, sector and accounting year end come from the current company profile; principal-contact suggestions come from current PSC and officer records.",
+  "generated_at_utc": "2026-09-24T17:52:52.840451+00:00",
   "latest_screened_candidates": 635,
   "latest_unique_companies": 16058,
   "latest_new_candidates": 264,
@@ -146,5 +146,5 @@
   "latest_newly_archived": 0,
   "profile_enrichment_enabled": true,
   "profile_backfilled_or_refreshed": 0,
-  "profile_archived_after_enrichment": 371
+  "profile_archived_after_enrichment": 0
 }
