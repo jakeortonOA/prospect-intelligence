@@ -120,5 +120,21 @@
     "newly_archived": 0,
     "status": "processed",
     "processed_at_utc": "2026-09-24T12:59:08.141238+00:00"
+  },
+  {
+    "date": "2026-09-25",
+    "file": "Accounts_Bulk_Data-2026-09-25.zip",
+    "filings": 17184,
+    "unique_companies": 17126,
+    "parse_failures": 0,
+    "financial_prescreen_candidates": 651,
+    "new_candidates": 271,
+    "refreshed_candidates": 0,
+    "sector_or_geo_rejected_after_profile": 379,
+    "inactive_rejected_after_profile": 1,
+    "integrity_rejected_after_profile": 0,
+    "newly_archived": 0,
+    "status": "processed",
+    "processed_at_utc": "2026-09-25T13:03:51.897247+00:00"
   }
 ]
